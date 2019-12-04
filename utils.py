@@ -14,6 +14,22 @@ def parse_args(argv=None):
 
     # add all arguments
     parser.add_argument(
+        '--use_random_position',
+        action='store_true',
+        help="Whether to use random start position in gpt"
+    )
+    parser.add_argument(
+        '--use_discount',
+        action='store_true',
+        help="Whether to use discount"
+    )
+    parser.add_argument(
+        "--kl_model_type",
+        default="small",
+        type=str,
+        help="The initial learning rate for AdamW."
+    )
+    parser.add_argument(
         "--learning_rate",
         default=1e-4,
         type=float,

@@ -3,11 +3,11 @@ import torch
 import torch.nn as nn
 import logging
 
-from transformers import AdamW, WarmupLinearSchedule
-from torchfly.transformers import UnifiedTokenizer, GPT2SimpleLM, UnifiedGPT2SmallConfig
-from torchfly.utils import get_pretrained, init_logging
-from torchfly.criterions import SequenceCrossEntropyLoss
-
+from torchfly.modules.transformers import GPT2SimpleLM, UnifiedGPT2SmallConfig, UnifiedGPT2LargeConfig
+from torchfly.utils import init_logging
+# from torchfly.criterions import SequenceCrossEntropyLoss
+from torchfly.modules.losses import SequenceCrossEntropyLoss
+from torchfly.utils import get_pretrained_states
 import utils
 
 init_logging()
@@ -57,21 +57,39 @@ class ARDM(nn.Module):
         # define the two language models
         self.model_A = GPT2SimpleLM(UnifiedGPT2SmallConfig)
         self.model_B = GPT2SimpleLM(UnifiedGPT2SmallConfig)
-        # language model KL
-        self.language_model = GPT2SimpleLM(UnifiedGPT2SmallConfig)
         # load weights
-        self.model_A.load_state_dict(get_pretrained("unified-gpt2-small"))
-        self.model_B.load_state_dict(get_pretrained("unified-gpt2-small"))
-        self.language_model.load_state_dict(
-            get_pretrained("unified-gpt2-small")
-        )
+        self.model_A.load_state_dict(get_pretrained_states("unified-gpt2-small"))
+        self.model_B.load_state_dict(get_pretrained_states("unified-gpt2-small"))
+        
+        # language model KL
+        if args.kl_model_type == "small":
+            self.language_model = GPT2SimpleLM(UnifiedGPT2SmallConfig)
+            self.language_model.load_state_dict(
+                get_pretrained_states("unified-gpt2-small")
+            )
+        elif args.kl_model_type == "large":
+            self.language_model = GPT2SimpleLM(UnifiedGPT2LargeConfig)
+            self.language_model.load_state_dict(
+                get_pretrained_states("unified-gpt2-large-fp16"), strict=False
+            )
+        elif args.kl_model_type == "no":
+            self.language_model = GPT2SimpleLM(UnifiedGPT2SmallConfig)
+            self.language_model.load_state_dict(
+                get_pretrained_states("unified-gpt2-small")
+            )
+        else:
+            raise ValueError("kl model name error")
         # freeze weights
         utils.freeze_model(self.language_model)
 
         self.criterion = sequence_ce_lm_loss
         self.lm_coef = 0.1
         self.lm_coef_decay = 0.9999
-        self.discount_factor = 0.95
+
+        if args.use_discount:
+            self.discount_factor = 0.95
+        else:
+            self.discount_factor = 1.00
         self.lm_stream = torch.cuda.Stream()
 
     def forward(self, dialog):
@@ -114,7 +132,10 @@ class ARDM(nn.Module):
             else:
                 logits, past = self.model_B(dialog[turn_idx], position_ids=dialog_position_ids[turn_idx], past=past)
 
-            loss, lm_kl = self.get_loss(dialog[turn_idx], logits, lm_logits)
+            if self.args.kl_model_type == "no":
+                loss, lm_kl = self.get_loss(dialog[turn_idx], logits, logits)
+            else:
+                loss, lm_kl = self.get_loss(dialog[turn_idx], logits, lm_logits)
             total_loss += discount_coef[turn_idx] * loss
             total_kl += lm_kl.item()
 
@@ -135,69 +156,3 @@ def dialog_to_tensor(tokenzier, dialog, device=None):
     if device:
         res = [item.to(device) for item in res]
     return res
-
-
-if __name__ == "__main__":
-    args = utils.parse_args()
-
-    # test case
-    dialog = [
-        "A:Hello, how are you doing?",
-        "B:I am fine. thank you for asking.",
-        "A:have you watched the newest star wars movie",
-        "B:No, I didn't. is it good?",
-        "A:Yes, it is good. you should watch it.",
-    ]
-    tokenizer = UnifiedTokenizer()
-
-    device = torch.device("cuda")
-    model = ARDM(args)
-    model = model.to(device)
-
-    num_train_optimization_steps = (
-        1 * args.num_train_epochs // args.batch_size //
-        args.gradient_accumulation_steps
-    )
-
-    param_optimizer = model.named_parameters()
-
-    no_decay = ["bias", "ln", "LayerNorm.weight"]
-    optimizer_grouped_parameters = [
-        {
-            "params":
-                [
-                    p for n, p in param_optimizer
-                    if not any(nd in n for nd in no_decay)
-                ],
-            "weight_decay": 0.01,
-        },
-        {
-            "params":
-                [
-                    p for n, p in param_optimizer
-                    if any(nd in n for nd in no_decay)
-                ],
-            "weight_decay": 0.0,
-        },
-    ]
-
-    # dialog = dialog_to_tensor(tokenizer, dialog, device)
-    optimizer = AdamW(optimizer_grouped_parameters, lr=1e-3, eps=1e-06)
-
-    scheduler = WarmupLinearSchedule(
-        optimizer, warmup_steps=500, t_total=num_train_optimization_steps
-    )
-
-    for i in range(1000):
-        dialog = [
-            torch.LongTensor([np.arange(200)]).to(device) for i in range(5)
-        ]
-
-        loss, kl = model.train_one_dialog(dialog)
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        scheduler.step()
-
-        logger.info(f"KL is {kl}")

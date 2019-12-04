@@ -7,7 +7,7 @@ python -m torch.distributed.launch \
     --gradient_accumulation_steps 4 \
     --num_train_epochs 20 \
     --logging_steps 10 \
-    --kl_model_type large \
+    --kl_model_type no \
     --use_discount \
     --use_random_position
 

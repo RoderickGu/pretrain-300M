@@ -7,13 +7,20 @@ import tqdm
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, RandomSampler, DistributedSampler
-from torch.utils.tensorboard import SummaryWriter
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except:
+    from tensorboardX import SummaryWriter
+
 from allennlp.training.checkpointer import Checkpointer
 import logging
 
-from torchfly.transformers import UnifiedTokenizer, GPT2SimpleLM
-from torchfly.utils import get_pretrained, init_logging
-from transformers import AdamW, WarmupLinearSchedule
+# from torchfly.modules.transformers import UnifiedTokenizer, GPT2SimpleLM
+from torchfly.text.tokenizers import UnifiedBPETokenizer
+from torchfly.modules.transformers import GPT2SimpleLM
+from torchfly.utils import get_pretrained_states, init_logging
+from transformers import AdamW, get_linear_schedule_with_warmup
 
 from dialog_utils import DialogFragmentSampler
 from distributed_utils import DistributedManager
@@ -24,13 +31,14 @@ logger = logging.getLogger(__name__)
 
 
 class DialogCorpusDataset(Dataset):
-    def __init__(self, data, tokenizer):
+    def __init__(self, data, tokenizer, args):
         # only interested in the values
         self.data = list(data.values())
         self.tokenizer = tokenizer
         self.tokenizer.max_len = 4096
         self.turn_ending = tokenizer.encode("\n\n\n")
         self.sampler = DialogFragmentSampler(max_tokens=800)
+        self.args = args
 
     def __len__(self):
         return len(self.data)
@@ -51,7 +59,11 @@ class DialogCorpusDataset(Dataset):
 
         total_len = sum([len(item) for item in inputs[0]])
         # make random positions
-        start_position = random.randint(0, 1024 - total_len)
+
+        if self.args.use_random_position:
+            start_position = random.randint(0, 1024 - total_len)
+        else:
+            start_position = 0
 
         position_ids = []
         for item in inputs[0]:
@@ -93,13 +105,13 @@ if __name__ == '__main__':
     manager = DistributedManager(args)
 
     # define the tokenizer
-    tokenizer = UnifiedTokenizer()
+    tokenizer = UnifiedBPETokenizer()
 
     # construct dataset
     with open("dialog_corpus.json") as f:
         train_data = json.load(f)
 
-    train_dataset = DialogCorpusDataset(train_data, tokenizer)
+    train_dataset = DialogCorpusDataset(train_data, tokenizer, args)
 
     if args.local_rank == -1:
         train_sampler = RandomSampler(train_dataset)
@@ -126,9 +138,9 @@ if __name__ == '__main__':
     if args.warmup_steps < 0:
         args.warmup_steps = int(args.warmup_ratio * len(train_dataset))
 
-    scheduler = WarmupLinearSchedule(optimizer,
-                                     warmup_steps=args.warmup_steps,
-                                     t_total=num_train_optimization_steps)
+    scheduler = get_linear_schedule_with_warmup(optimizer,
+                                     num_warmup_steps=args.warmup_steps,
+                                     num_training_steps=num_train_optimization_steps)
 
     manager.init_training(model, optimizer)
 
@@ -139,12 +151,24 @@ if __name__ == '__main__':
         progress_bar = iter
 
     if manager.is_main_rank():
+
+        if not os.path.exists('Checkpoint'):
+            os.mkdir('Checkpoint')
         checkpointer = Checkpointer(
             "Checkpoint",
             keep_serialized_model_every_num_seconds=3600 * 4,
             num_serialized_models_to_keep=10)
+
+        if not os.path.isdir("Checkpoint-Constant-Time"):
+            os.mkdir("Checkpoint-Constant-Time")
+        checkpointer_constant_time = Checkpointer(
+            "Checkpoint-Constant-Time",
+            keep_serialized_model_every_num_seconds=None,
+            num_serialized_models_to_keep=-1)
+
         writer = SummaryWriter()
         start = time.time()
+        constant_start = time.time()
         update_loss = 0.0
         update_kl = 0.0
 
@@ -173,7 +197,8 @@ if __name__ == '__main__':
                     # show progress
                     pbar.set_postfix(loss=update_loss,
                                      kl=update_kl,
-                                     speed=speed)
+                                     speed=speed,
+                                     epoch=ep)
 
             # post-processing
             if manager.is_main_rank():
@@ -191,3 +216,10 @@ if __name__ == '__main__':
                                                  model.state_dict(),
                                                  optimizer.state_dict(),
                                                  is_best_so_far=True)
+
+                if time.time() - constant_start > 2*3600:
+                    constant_start = time.time()
+                    checkpointer_constant_time.save_checkpoint(update_count,
+                                                               model.state_dict(),
+                                                               optimizer.state_dict(),
+                                                               is_best_so_far=True)

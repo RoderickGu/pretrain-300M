@@ -7,8 +7,8 @@ python -m torch.distributed.launch \
     --gradient_accumulation_steps 4 \
     --num_train_epochs 20 \
     --logging_steps 10 \
-    --kl_model_type large \
-    --use_discount \
+    --kl_model_type small \
     --use_random_position
+#    --use_discount
 
 # screen -S dialog_pretrain -L -Logfile pretrain.log
